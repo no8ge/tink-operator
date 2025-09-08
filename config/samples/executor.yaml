@@ -1,0 +1,22 @@
+apiVersion: autotest.atop.io/v1alpha1
+kind: Executor
+metadata:
+  name: executor-service-native
+spec:
+  image: no8ge/demo:v1.0.0
+  command: ["sh", "-c", "locust -f src/locustfile.py -u 10 -r 10 --host http://demo.default:8002 --web-host=0.0.0.0 --web-port=9090 --loglevel=DEBUG --csv=report"]
+  ports:
+    - containerPort: 9090
+      name: http
+      protocol: TCP
+  replicas: 1
+  artifacts:
+    path: /demo/report
+    name: /index.html
+  storage:
+    minioEndpoint: "http://172.16.60.10:32033"
+    bucket: "result"
+    prefix: "executor-service-native"
+    accessKeySecret: "admin"
+    secretKeySecret: "changeme"
+

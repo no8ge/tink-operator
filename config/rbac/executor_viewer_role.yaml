@@ -1,0 +1,23 @@
+# permissions for end users to view executors.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: tink-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: executor-viewer-role
+rules:
+- apiGroups:
+  - autotest.atop.io
+  resources:
+  - executors
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - autotest.atop.io
+  resources:
+  - executors/status
+  verbs:
+  - get
