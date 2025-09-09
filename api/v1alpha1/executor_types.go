@@ -1,27 +1,18 @@
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // ExecutorSpec defines the desired state of Executor
 type ExecutorSpec struct {
-	// 简化字段：由控制器生成 Deployment
-	Image            string                        `json:"image"`
-	Command          []string                      `json:"command,omitempty"`
-	Env              []corev1.EnvVar               `json:"env,omitempty"`
-	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
-	Replicas         *int32                        `json:"replicas,omitempty"`
-	Resources        corev1.ResourceRequirements   `json:"resources,omitempty"`
-	Ports            []corev1.ContainerPort        `json:"ports,omitempty"`
+	// 原生 DeploymentSpec，用户定义工作负载，Operator 仅做最小注入
+	appsv1.DeploymentSpec `json:",inline"`
 
-	// 契约：artifacts.root
-	// 说明：测试/服务产物根目录；仅当与 Storage 一并配置时，控制器才注入上传 sidecar。
+	// 产物目录与对象存储，仅当两者同时配置时注入上传逻辑
 	Artifacts ArtifactsConfig `json:"artifacts,omitempty"`
-	// 契约：artifacts 目标存储
-	// 说明：对象存储目标（endpoint/bucket/prefix/凭证）；仅当与 Artifacts.Path 一并配置时启用上传。
-	Storage StorageConfig `json:"storage,omitempty"`
+	Storage   StorageConfig   `json:"storage,omitempty"`
 }
 
 type ArtifactsConfig struct {

@@ -1,30 +1,32 @@
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // RunnerSpec defines the desired state of Runner (one-shot Job)
 type RunnerSpec struct {
-	// 简化字段：由控制器生成 Job
-	Image            string                        `json:"image"`
-	Command          []string                      `json:"command,omitempty"`
-	Env              []corev1.EnvVar               `json:"env,omitempty"`
-	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
-	BackoffLimit     *int32                        `json:"backoffLimit,omitempty"`
+	batchv1.JobSpec `json:",inline"`
 
-	// 契约：artifacts.root（必填）
 	Artifacts ArtifactsConfig `json:"artifacts,omitempty"`
-	// 契约：artifacts 目标存储（必填）
-	Storage StorageConfig `json:"storage,omitempty"`
+	Storage   StorageConfig   `json:"storage,omitempty"`
 }
 
 // RunnerStatus defines the observed state of Runner
+type RunnerPhase string
+
+const (
+	RunnerPending   RunnerPhase = "Pending"
+	RunnerRunning   RunnerPhase = "Running"
+	RunnerSucceeded RunnerPhase = "Succeeded"
+	RunnerFailed    RunnerPhase = "Failed"
+)
+
 type RunnerStatus struct {
-	Phase        string `json:"phase"`
-	ReportStatus string `json:"reportStatus"`
-	ReportURL    string `json:"reportURL"`
+	Phase        RunnerPhase `json:"phase"`
+	ReportStatus string      `json:"reportStatus,omitempty"`
+	ReportURL    string      `json:"reportURL,omitempty"`
 }
 
 //+kubebuilder:object:root=true

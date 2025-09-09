@@ -3,13 +3,30 @@ kind: Executor
 metadata:
   name: executor-service-native
 spec:
-  image: no8ge/demo:v1.0.0
-  command: ["sh", "-c", "locust -f src/locustfile.py -u 10 -r 10 --host http://demo.default:8002 --web-host=0.0.0.0 --web-port=9090 --loglevel=DEBUG --csv=report"]
-  ports:
-    - containerPort: 9090
-      name: http
-      protocol: TCP
   replicas: 1
+  selector:
+    matchLabels:
+      app: executor-service-native
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    spec:
+      containers:
+      - name: server
+        image: no8ge/demo:v1.0.0
+        command:
+          - sh
+          - -c
+          - >
+            locust -f src/locustfile.py -u 10 -r 10 --host http://demo.default:8002
+            --web-host=0.0.0.0 --web-port=9090 --loglevel=DEBUG --csv=/demo/report/result
+        ports:
+        - containerPort: 9090
+          name: http
+          protocol: TCP
   artifacts:
     path: /demo/report
     name: /index.html

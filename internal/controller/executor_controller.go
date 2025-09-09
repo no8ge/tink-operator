@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"reflect"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -33,71 +34,43 @@ import (
 	atopv1alpha1 "github.com/no8ge/tink-operator/api/v1alpha1"
 )
 
-// executorTemplateHashInput captures only fields that affect PodTemplate rendering
-type executorTemplateHashInput struct {
-	Image            string                        `json:"image"`
-	Command          []string                      `json:"command,omitempty"`
-	Env              []corev1.EnvVar               `json:"env,omitempty"`
-	Resources        corev1.ResourceRequirements   `json:"resources,omitempty"`
-	Ports            []corev1.ContainerPort        `json:"ports,omitempty"`
-	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
+func buildDesiredExecutorDeployment(ex *atopv1alpha1.Executor) *appsv1.Deployment {
+	// 复制用户定义的 DeploymentSpec
+	deploySpec := ex.Spec.DeploymentSpec.DeepCopy()
 
-	ReportPath string `json:"reportPath"`
-	WithWatch  bool   `json:"withWatch"`
-	Storage    struct {
-		Bucket        string `json:"bucket"`
-		Prefix        string `json:"prefix"`
-		MinioEndpoint string `json:"minioEndpoint"`
-		AccessKey     string `json:"accessKey"`
-		SecretKey     string `json:"secretKey"`
-	} `json:"storage"`
-}
-
-func computeSpecHashForExecutor(ex *atopv1alpha1.Executor, withWatch bool) string {
-	reportPath := normalizeReportPath(ex.Spec.Artifacts.Path)
-	input := executorTemplateHashInput{
-		Image:            ex.Spec.Image,
-		Command:          ex.Spec.Command,
-		Env:              sortedEnv(ex.Spec.Env),
-		Resources:        ex.Spec.Resources,
-		Ports:            sortedPorts(ex.Spec.Ports),
-		ImagePullSecrets: sortedImagePullSecrets(ex.Spec.ImagePullSecrets),
-		ReportPath:       reportPath,
-		WithWatch:        withWatch,
+	// 确保 Pod 模板有必要的字段
+	if deploySpec.Template.Spec.Volumes == nil {
+		deploySpec.Template.Spec.Volumes = []corev1.Volume{}
 	}
-	input.Storage.Bucket = ex.Spec.Storage.Bucket
-	input.Storage.Prefix = ex.Spec.Storage.Prefix
-	input.Storage.MinioEndpoint = ex.Spec.Storage.MinioEndpoint
-	input.Storage.AccessKey = ex.Spec.Storage.AccessKeySecret
-	input.Storage.SecretKey = ex.Spec.Storage.SecretKeySecret
 
-	return computeSHA256Hex(input)
-}
+	// 确保有 app 标签用于 selector
+	if deploySpec.Template.ObjectMeta.Labels == nil {
+		deploySpec.Template.ObjectMeta.Labels = map[string]string{}
+	}
+	deploySpec.Template.ObjectMeta.Labels["app"] = ex.Name
 
-// buildDesiredExecutorTemplate renders the full PodTemplate including volume/mounts and sidecar
-func buildDesiredExecutorTemplate(ex *atopv1alpha1.Executor) corev1.PodTemplateSpec {
-	labels := map[string]string{"app": ex.Name}
-	pod := corev1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{Labels: labels},
-		Spec: corev1.PodSpec{
-			ImagePullSecrets: ex.Spec.ImagePullSecrets,
-			Volumes:          []corev1.Volume{},
-			Containers: []corev1.Container{
-				{
-					Name:            "server",
-					Image:           ex.Spec.Image,
-					ImagePullPolicy: corev1.PullIfNotPresent,
-					Command:         ex.Spec.Command,
-					Env:             ex.Spec.Env,
-					Resources:       ex.Spec.Resources,
-					Ports:           ex.Spec.Ports,
-				},
+	// 确保有 selector
+	if deploySpec.Selector == nil {
+		deploySpec.Selector = &metav1.LabelSelector{
+			MatchLabels: map[string]string{"app": ex.Name},
+		}
+	}
+
+	// 注入共享卷与 mc 边车（watch 模式用于长期运行服务）
+	// Executor 需要处理 InitContainer
+	ensureUploadInjectionForPodSpec(&deploySpec.Template.Spec, ex.Spec.Artifacts, ex.Spec.Storage, true, true)
+
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ex.Name,
+			Namespace: ex.Namespace,
+			Labels:    map[string]string{"app.kubernetes.io/managed-by": "tink-operator"},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(ex, atopv1alpha1.GroupVersion.WithKind("Executor")),
 			},
 		},
+		Spec: *deploySpec,
 	}
-	// inject shared volume, mounts and mc sidecar
-	ensureUploadInjectionForPodSpec(&pod.Spec, ex, true)
-	return pod
 }
 
 // ExecutorReconciler reconciles an Executor object
@@ -130,68 +103,36 @@ func (r *ExecutorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 }
 
 func (r *ExecutorReconciler) reconcileDeployment(ctx context.Context, ex *atopv1alpha1.Executor) (ctrl.Result, error) {
-	log := log.FromContext(ctx)
+	logger := log.FromContext(ctx)
 
 	dep := &appsv1.Deployment{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: ex.Namespace, Name: ex.Name}, dep); err != nil {
 		if errors.IsNotFound(err) {
-			replicas := int32(1)
-			if ex.Spec.Replicas != nil {
-				replicas = *ex.Spec.Replicas
-			}
-			pod := buildDesiredExecutorTemplate(ex)
-			// set spec hash annotation for rolling update detection
-			if pod.Annotations == nil {
-				pod.Annotations = map[string]string{}
-			}
-			pod.Annotations[annotationSpecHash] = computeSpecHashForExecutor(ex, true)
-			dep = &appsv1.Deployment{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:            ex.Name,
-					Namespace:       ex.Namespace,
-					Labels:          map[string]string{"app.kubernetes.io/managed-by": "tink-operator"},
-					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(ex, atopv1alpha1.GroupVersion.WithKind("Executor"))},
-				},
-				Spec: appsv1.DeploymentSpec{Replicas: &replicas, Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": ex.Name}}, Template: pod},
-			}
+			dep = buildDesiredExecutorDeployment(ex)
+
 			if err := r.Create(ctx, dep); err != nil {
-				log.Error(err, "failed to create Deployment")
+				logger.Error(err, "Failed to create Deployment for Executor", "executor", ex.Name)
 				return ctrl.Result{}, err
 			}
-			r.Recorder.Eventf(ex, corev1.EventTypeNormal, reasonCreateDeployment, "created Deployment %s/%s", dep.Namespace, dep.Name)
-		} else {
-			log.Error(err, "failed to get Deployment")
-			return ctrl.Result{}, err
+			r.Recorder.Eventf(ex, corev1.EventTypeNormal, reasonCreateDeployment, "Created Deployment %s/%s", dep.Namespace, dep.Name)
+			logger.Info("Created Deployment for Executor", "executor", ex.Name, "deployment", dep.Name)
+			return ctrl.Result{}, nil
 		}
+		logger.Error(err, "Failed to get Deployment", "executor", ex.Name)
+		return ctrl.Result{}, err
 	}
 
-	// If exists, ensure spec hash and template are up to date
-	desiredPod := buildDesiredExecutorTemplate(ex)
-	if desiredPod.Annotations == nil {
-		desiredPod.Annotations = map[string]string{}
-	}
-	newHash := computeSpecHashForExecutor(ex, true)
-	desiredPod.Annotations[annotationSpecHash] = newHash
-
-	oldHash := ""
-	if dep.Spec.Template.Annotations != nil {
-		oldHash = dep.Spec.Template.Annotations[annotationSpecHash]
-	}
-	// Update replicas regardless of template changes
-	replicas := int32(1)
-	if ex.Spec.Replicas != nil {
-		replicas = *ex.Spec.Replicas
-	}
-	if dep.Spec.Replicas == nil || *dep.Spec.Replicas != replicas {
-		dep.Spec.Replicas = &replicas
-	}
-	if oldHash != newHash {
-		dep.Spec.Template = desiredPod
+	// 使用 Kubernetes 原生的 Deployment 滚动更新
+	// 通过比较整个 DeploymentSpec 来检测变更
+	desiredDep := buildDesiredExecutorDeployment(ex)
+	if !reflect.DeepEqual(dep.Spec, desiredDep.Spec) {
+		logger.Info("Executor spec changed, updating Deployment", "executor", ex.Name)
+		dep.Spec = desiredDep.Spec
 		if err := r.Update(ctx, dep); err != nil {
-			log.Error(err, "failed to update Deployment template")
+			logger.Error(err, "Failed to update Deployment", "executor", ex.Name)
 			return ctrl.Result{}, err
 		}
-		r.Recorder.Eventf(ex, corev1.EventTypeNormal, reasonUpdateDeploymentTpl, "updated Deployment template due to spec change: oldHash=%s newHash=%s", oldHash, newHash)
+		logger.Info("Updated Deployment for Executor", "executor", ex.Name)
 	}
 
 	// 更新状态
@@ -199,19 +140,26 @@ func (r *ExecutorReconciler) reconcileDeployment(ctx context.Context, ex *atopv1
 	if dep.Status.ReadyReplicas > 0 {
 		phase = "Available"
 	}
+
+	if ex.Status.Phase != phase {
+		logger.Info("Updating Executor status", "executor", ex.Name, "oldPhase", ex.Status.Phase, "newPhase", phase)
+	}
+
 	ex.Status.Phase = phase
 	ex.Status.ReportStatus = ""
 	if err := r.Status().Update(ctx, ex); err != nil {
+		logger.Error(err, "Failed to update Executor status", "executor", ex.Name)
 		return ctrl.Result{}, err
 	}
+
 	return ctrl.Result{}, nil
 }
 
 // ensureUploadInjectionForPodSpec injects shared-data volume and mc sidecar if storage/report are set
-func ensureUploadInjectionForPodSpec(podSpec *corev1.PodSpec, m *atopv1alpha1.Executor, withWatch bool) {
+func ensureUploadInjectionForPodSpec(podSpec *corev1.PodSpec, artifacts atopv1alpha1.ArtifactsConfig, storage atopv1alpha1.StorageConfig, withWatch bool, handleInitContainers bool) {
 	// 启用条件：必须同时具备 report.path 与 storage 关键字段
 	enabled := true
-	if m.Spec.Artifacts.Path == "" || m.Spec.Storage.Bucket == "" || m.Spec.Storage.MinioEndpoint == "" {
+	if artifacts.Path == "" || storage.Bucket == "" || storage.MinioEndpoint == "" {
 		enabled = false
 	}
 	if !enabled {
@@ -231,14 +179,15 @@ func ensureUploadInjectionForPodSpec(podSpec *corev1.PodSpec, m *atopv1alpha1.Ex
 	// 选择容器并挂载：默认第一个容器
 	targetIdx := 0
 	if len(podSpec.Containers) > 0 {
-		rMountPath := m.Spec.Artifacts.Path
+		rMountPath := artifacts.Path
 		if rMountPath == "" {
 			rMountPath = defaultReportPath
 		}
 		hasMount := false
 		for j := range podSpec.Containers[targetIdx].VolumeMounts {
 			vm := podSpec.Containers[targetIdx].VolumeMounts[j]
-			if vm.Name == volName || vm.MountPath == rMountPath {
+			// 检查是否已经有相同的卷挂载或相同的挂载路径
+			if (vm.Name == volName && vm.MountPath == rMountPath) || vm.MountPath == rMountPath {
 				hasMount = true
 				break
 			}
@@ -246,23 +195,33 @@ func ensureUploadInjectionForPodSpec(podSpec *corev1.PodSpec, m *atopv1alpha1.Ex
 		if !hasMount {
 			podSpec.Containers[targetIdx].VolumeMounts = append(podSpec.Containers[targetIdx].VolumeMounts, corev1.VolumeMount{Name: volName, MountPath: rMountPath})
 		}
+		// Runner 模式下，用户容器已移到 initContainers
+		// 不需要为 containers 添加 .done 文件逻辑
 	}
-	// 同步挂载共享卷到第一个 initContainer，以便其输出与 mc 共享
-	if len(podSpec.InitContainers) > 0 {
-		rMountPath := m.Spec.Artifacts.Path
+	// 同步挂载共享卷到 initContainer，以便其输出与 mc 共享
+	if handleInitContainers && len(podSpec.InitContainers) > 0 {
+		rMountPath := artifacts.Path
 		if rMountPath == "" {
 			rMountPath = defaultReportPath
 		}
-		hasMount := false
-		for j := range podSpec.InitContainers[0].VolumeMounts {
-			vm := podSpec.InitContainers[0].VolumeMounts[j]
-			if vm.Name == volName || vm.MountPath == rMountPath {
-				hasMount = true
-				break
+
+		// 为所有 initContainer 添加共享卷挂载和 .done 文件创建逻辑
+		for i := range podSpec.InitContainers {
+			// 检查并添加卷挂载
+			hasMount := false
+			for j := range podSpec.InitContainers[i].VolumeMounts {
+				vm := podSpec.InitContainers[i].VolumeMounts[j]
+				if (vm.Name == volName && vm.MountPath == rMountPath) || vm.MountPath == rMountPath {
+					hasMount = true
+					break
+				}
 			}
-		}
-		if !hasMount {
-			podSpec.InitContainers[0].VolumeMounts = append(podSpec.InitContainers[0].VolumeMounts, corev1.VolumeMount{Name: volName, MountPath: rMountPath})
+			if !hasMount {
+				podSpec.InitContainers[i].VolumeMounts = append(podSpec.InitContainers[i].VolumeMounts, corev1.VolumeMount{Name: volName, MountPath: rMountPath})
+			}
+
+			// InitContainer 完成后，Kubernetes 会自动启动主容器
+			// 不需要额外的 .done 文件信号机制
 		}
 	}
 	// 注入 mc
@@ -274,17 +233,38 @@ func ensureUploadInjectionForPodSpec(podSpec *corev1.PodSpec, m *atopv1alpha1.Ex
 		}
 	}
 	if !hasMc {
-		sourcePath := m.Spec.Artifacts.Path
+		sourcePath := artifacts.Path
 		if sourcePath == "" {
 			sourcePath = defaultReportPath
 		}
-		cmd := fmt.Sprintf("#!/usr/bin/env bash\nset -euo pipefail\nmc alias set atop-dev \"%s\" \"$ACCESS_KEY\" \"$SECRET_KEY\"\n", m.Spec.Storage.MinioEndpoint)
-		if withWatch {
-			cmd += fmt.Sprintf("mc mirror --overwrite --watch --remove \"%s\" \"atop-dev/%s/%s\"\n", sourcePath, m.Spec.Storage.Bucket, m.Spec.Storage.Prefix)
-		} else {
-			cmd += fmt.Sprintf("mc mirror --overwrite --remove \"%s\" \"atop-dev/%s/%s\"\n", sourcePath, m.Spec.Storage.Bucket, m.Spec.Storage.Prefix)
+		// 构建 mc 命令，使用转义防止注入
+		cmd := fmt.Sprintf("#!/usr/bin/env bash\nset -euo pipefail\nmc alias set atop-dev %q \"$ACCESS_KEY\" \"$SECRET_KEY\"\n", storage.MinioEndpoint)
+		if !withWatch {
+			// Runner 模式：InitContainer 完成后，Kubernetes 自动启动此容器
+			// 直接开始上传，无需等待文件信号
+			cmd += "echo 'InitContainer completed, starting upload...'\n"
 		}
-		mc := corev1.Container{Name: mcContainerName, Image: "minio/mc:latest", ImagePullPolicy: corev1.PullIfNotPresent, Command: []string{"sh", "-c", cmd}, Env: []corev1.EnvVar{{Name: "ACCESS_KEY", Value: m.Spec.Storage.AccessKeySecret}, {Name: "SECRET_KEY", Value: m.Spec.Storage.SecretKeySecret}}, VolumeMounts: []corev1.VolumeMount{{Name: volName, MountPath: sourcePath}}}
+		if withWatch {
+			// Executor 模式：实时监控并上传文件变化
+			cmd += fmt.Sprintf("mc mirror --overwrite --watch --remove %q atop-dev/%s/%s\n", sourcePath, storage.Bucket, storage.Prefix)
+		} else {
+			// Runner 模式：一次性上传所有文件
+			cmd += fmt.Sprintf("mc mirror --overwrite --remove %q atop-dev/%s/%s\n", sourcePath, storage.Bucket, storage.Prefix)
+			cmd += "echo 'Upload completed successfully'\n"
+		}
+
+		// 使用明文传递账号密码
+		mc := corev1.Container{
+			Name:            mcContainerName,
+			Image:           "minio/mc:latest",
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Command:         []string{"sh", "-c", cmd},
+			Env: []corev1.EnvVar{
+				{Name: "ACCESS_KEY", Value: storage.AccessKeySecret},
+				{Name: "SECRET_KEY", Value: storage.SecretKeySecret},
+			},
+			VolumeMounts: []corev1.VolumeMount{{Name: volName, MountPath: sourcePath}},
+		}
 		podSpec.Containers = append(podSpec.Containers, mc)
 	}
 }

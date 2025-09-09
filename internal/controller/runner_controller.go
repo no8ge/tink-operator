@@ -17,69 +17,45 @@ import (
 	atopv1alpha1 "github.com/no8ge/tink-operator/api/v1alpha1"
 )
 
-const (
-	annotationSpecHashRunner = "autotest.atop.io/spec-hash"
-)
-
-type runnerTemplateHashInput struct {
-	Image            string                        `json:"image"`
-	Command          []string                      `json:"command,omitempty"`
-	Env              []corev1.EnvVar               `json:"env,omitempty"`
-	ImagePullSecrets []corev1.LocalObjectReference `json:"imagePullSecrets,omitempty"`
-	BackoffLimit     *int32                        `json:"backoffLimit,omitempty"`
-
-	ReportPath string `json:"reportPath"`
-	WithWatch  bool   `json:"withWatch"`
-	Storage    struct {
-		Bucket        string `json:"bucket"`
-		Prefix        string `json:"prefix"`
-		MinioEndpoint string `json:"minioEndpoint"`
-		AccessKey     string `json:"accessKey"`
-		SecretKey     string `json:"secretKey"`
-	} `json:"storage"`
-}
-
-func computeSpecHashForRunner(r *atopv1alpha1.Runner, withWatch bool) string {
-	reportPath := normalizeReportPath(r.Spec.Artifacts.Path)
-	input := runnerTemplateHashInput{
-		Image:            r.Spec.Image,
-		Command:          r.Spec.Command,
-		Env:              sortedEnv(r.Spec.Env),
-		ImagePullSecrets: sortedImagePullSecrets(r.Spec.ImagePullSecrets),
-		BackoffLimit:     r.Spec.BackoffLimit,
-		ReportPath:       reportPath,
-		WithWatch:        withWatch,
+func buildDesiredRunnerJob(runner *atopv1alpha1.Runner) *batchv1.Job {
+	// 复制用户定义的 JobSpec
+	jobSpec := runner.Spec.JobSpec.DeepCopy()
+	
+	// 确保 Pod 模板有必要的字段
+	if jobSpec.Template.Spec.Volumes == nil {
+		jobSpec.Template.Spec.Volumes = []corev1.Volume{}
 	}
-	input.Storage.Bucket = r.Spec.Storage.Bucket
-	input.Storage.Prefix = r.Spec.Storage.Prefix
-	input.Storage.MinioEndpoint = r.Spec.Storage.MinioEndpoint
-	input.Storage.AccessKey = r.Spec.Storage.AccessKeySecret
-	input.Storage.SecretKey = r.Spec.Storage.SecretKeySecret
+	if jobSpec.Template.Spec.InitContainers == nil {
+		jobSpec.Template.Spec.InitContainers = []corev1.Container{}
+	}
 
-	return computeSHA256Hex(input)
-}
+	// 将用户定义的容器移动到 initContainers
+	if len(jobSpec.Template.Spec.Containers) > 0 {
+		// 将所有用户容器移动到 initContainers
+		for _, container := range jobSpec.Template.Spec.Containers {
+			// 确保 initContainer 有正确的重启策略相关设置
+			initContainer := container.DeepCopy()
+			jobSpec.Template.Spec.InitContainers = append(jobSpec.Template.Spec.InitContainers, *initContainer)
+		}
+		// 清空原来的 containers，稍后会添加 mc 容器
+		jobSpec.Template.Spec.Containers = []corev1.Container{}
+	}
 
-func buildDesiredRunnerTemplate(runner *atopv1alpha1.Runner) corev1.PodTemplateSpec {
-	pod := corev1.PodTemplateSpec{
-		Spec: corev1.PodSpec{
-			RestartPolicy:    corev1.RestartPolicyNever,
-			ImagePullSecrets: runner.Spec.ImagePullSecrets,
-			Volumes:          []corev1.Volume{},
-			InitContainers: []corev1.Container{
-				{
-					Name:            "worker",
-					Image:           runner.Spec.Image,
-					ImagePullPolicy: corev1.PullIfNotPresent,
-					Command:         runner.Spec.Command,
-					Env:             runner.Spec.Env,
-				},
+	// 注入共享卷与 mc；Runner 使用一次性上传（不 watch）且等待 .done
+	// 现在 initContainer 会处理主要工作，mc 作为主容器等待并上传
+	ensureUploadInjectionForPodSpec(&jobSpec.Template.Spec, runner.Spec.Artifacts, runner.Spec.Storage, false, true)
+
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      runner.Name,
+			Namespace: runner.Namespace,
+			Labels:    map[string]string{"app.kubernetes.io/managed-by": "tink-operator"},
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(runner, atopv1alpha1.GroupVersion.WithKind("Runner")),
 			},
-			Containers: []corev1.Container{},
 		},
+		Spec: *jobSpec,
 	}
-	// 强制注入 mc，无论 Upload.Enabled
-	ensureUploadInjectionForPodSpec(&pod.Spec, &atopv1alpha1.Executor{Spec: atopv1alpha1.ExecutorSpec{Artifacts: runner.Spec.Artifacts, Storage: runner.Spec.Storage}}, false)
-	return pod
 }
 
 // RunnerReconciler reconciles a Runner object
@@ -110,102 +86,65 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	job := &batchv1.Job{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: runner.Namespace, Name: runner.Name}, job); err != nil {
 		if errors.IsNotFound(err) {
-			// Render full PodTemplate from Spec and annotate with spec hash
-			backoff := int32(0)
-			if runner.Spec.BackoffLimit != nil {
-				backoff = *runner.Spec.BackoffLimit
-			}
-			pod := buildDesiredRunnerTemplate(runner)
-			if pod.Annotations == nil {
-				pod.Annotations = map[string]string{}
-			}
-			pod.Annotations[annotationSpecHashRunner] = computeSpecHashForRunner(runner, false)
+			job = buildDesiredRunnerJob(runner)
 
-			job = &batchv1.Job{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:            runner.Name,
-					Namespace:       runner.Namespace,
-					Labels:          map[string]string{"app.kubernetes.io/managed-by": "tink-operator"},
-					OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(runner, atopv1alpha1.GroupVersion.WithKind("Runner"))},
-				},
-				Spec: batchv1.JobSpec{BackoffLimit: &backoff, Template: pod},
-			}
 			if err := r.Create(ctx, job); err != nil {
-				logger.Error(err, "failed to create Job")
+				logger.Error(err, "Failed to create Job for Runner", "runner", runner.Name)
 				return ctrl.Result{}, err
 			}
-			r.Recorder.Eventf(runner, corev1.EventTypeNormal, reasonCreateJob, "created Job %s/%s", job.Namespace, job.Name)
+			r.Recorder.Eventf(runner, corev1.EventTypeNormal, reasonCreateJob, "Created Job %s/%s", job.Namespace, job.Name)
+			logger.Info("Created Job for Runner", "runner", runner.Name, "job", job.Name)
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
 
-	// If exists, check spec hash to decide whether to delete and recreate
-	oldHash := ""
-	if job.Spec.Template.Annotations != nil {
-		oldHash = job.Spec.Template.Annotations[annotationSpecHashRunner]
-	}
-	newTpl := buildDesiredRunnerTemplate(runner)
-	if newTpl.Annotations == nil {
-		newTpl.Annotations = map[string]string{}
-	}
-	newHash := computeSpecHashForRunner(runner, false)
-	newTpl.Annotations[annotationSpecHashRunner] = newHash
-	if oldHash != newHash {
-		// if job is still running, defer recreation
-		if job.Status.Active > 0 {
-			r.Recorder.Eventf(runner, corev1.EventTypeNormal, reasonDeferRecreate, "job is active, defer recreate until completion: oldHash=%s newHash=%s", oldHash, newHash)
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		// Delete old Job and let the next reconcile recreate it
-		if err := r.Delete(ctx, job); err != nil {
-			return ctrl.Result{}, err
-		}
-		r.Recorder.Eventf(runner, corev1.EventTypeNormal, reasonDeleteJobForSpecChange, "deleted Job for spec change: oldHash=%s newHash=%s", oldHash, newHash)
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
+	// Job 已存在，利用 Kubernetes 原生的 Job 不可变性
+	// 如果需要更新 Job 规格，依赖用户删除现有 Job 或 Runner 资源
 
-	phase := "Pending"
+	// 状态聚合
+	phase := atopv1alpha1.RunnerPending
 	for i := range job.Status.Conditions {
 		c := job.Status.Conditions[i]
 		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
-			phase = "Succeeded"
+			phase = atopv1alpha1.RunnerSucceeded
 			break
 		}
 		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
-			phase = "Failed"
+			phase = atopv1alpha1.RunnerFailed
 			break
 		}
 	}
-	if phase == "Pending" {
+	if phase == atopv1alpha1.RunnerPending {
 		if job.Status.Succeeded > 0 {
-			phase = "Succeeded"
+			phase = atopv1alpha1.RunnerSucceeded
 		} else if job.Status.Failed > 0 {
-			phase = "Failed"
+			phase = atopv1alpha1.RunnerFailed
 		} else if job.Status.Active > 0 {
-			phase = "Running"
+			phase = atopv1alpha1.RunnerRunning
 		}
 	}
 
-	newPhase := phase
-	newReportStatus := "Waiting"
-	newReportURL := ""
-	switch newPhase {
-	case "Succeeded":
-		newReportStatus = "Succeeded"
-		// ReportURL generated by external component or gateway
-	case "Running":
-		newReportStatus = "Uploading"
-	default:
-		newReportStatus = "Waiting"
+	// 更新状态
+	if runner.Status.Phase != phase {
+		logger.Info("Updating Runner status", "runner", runner.Name, "oldPhase", runner.Status.Phase, "newPhase", phase)
 	}
 
-	latest := &atopv1alpha1.Runner{}
-	if err := r.Get(ctx, req.NamespacedName, latest); err == nil {
-		latest.Status.Phase = newPhase
-		latest.Status.ReportStatus = newReportStatus
-		latest.Status.ReportURL = newReportURL
-		_ = r.Status().Update(ctx, latest)
+	runner.Status.Phase = phase
+	switch phase {
+	case atopv1alpha1.RunnerRunning:
+		runner.Status.ReportStatus = "Uploading"
+	case atopv1alpha1.RunnerSucceeded:
+		runner.Status.ReportStatus = "Succeeded"
+	case atopv1alpha1.RunnerFailed:
+		runner.Status.ReportStatus = "Failed"
+	default:
+		runner.Status.ReportStatus = "Waiting"
+	}
+
+	if err := r.Status().Update(ctx, runner); err != nil {
+		logger.Error(err, "Failed to update Runner status", "runner", runner.Name)
+		return ctrl.Result{RequeueAfter: time.Second}, err
 	}
 
 	return ctrl.Result{}, nil

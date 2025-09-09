@@ -3,12 +3,25 @@ kind: Runner
 metadata:
   name: runner-job
 spec:
-  image: no8ge/demo:v1.0.0
-  command: ["sh","-c","apache-jmeter-5.4.3/bin/jmeter -n -t src/demo.jmx -l /demo/report/test.jtl -e -o /demo/report -JHost=demo.default -Jtimes=120"]
-  env: []
-  imagePullSecrets:
-  - name: regcred
   backoffLimit: 0
+  ttlSecondsAfterFinished: 120
+  parallelism: 1
+  template:
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+      - name: regcred
+      containers:
+      - name: worker
+        image: no8ge/demo:v1.0.0
+        command:
+          - sh
+          - -c
+          - >
+            apache-jmeter-5.4.3/bin/jmeter -n -t src/demo.jmx
+            -l /demo/report/test.jtl -e -o /demo/report
+            -JHost=demo.default -Jtimes=90
+        env: []
   artifacts:
     path: /demo/report
     name: /index.html
@@ -18,4 +31,3 @@ spec:
     prefix: "runner-job"
     accessKeySecret: "admin"
     secretKeySecret: "changeme"
-
