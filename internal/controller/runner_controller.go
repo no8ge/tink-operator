@@ -20,7 +20,7 @@ import (
 func buildDesiredRunnerJob(runner *atopv1alpha1.Runner) *batchv1.Job {
 	// 复制用户定义的 JobSpec
 	jobSpec := runner.Spec.JobSpec.DeepCopy()
-	
+
 	// 确保 Pod 模板有必要的字段
 	if jobSpec.Template.Spec.Volumes == nil {
 		jobSpec.Template.Spec.Volumes = []corev1.Volume{}
@@ -86,6 +86,11 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	job := &batchv1.Job{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: runner.Namespace, Name: runner.Name}, job); err != nil {
 		if errors.IsNotFound(err) {
+			// Do not recreate the Job if Runner already reached a terminal phase (compatible with TTL cleanup)
+			if runner.Status.Phase == atopv1alpha1.RunnerSucceeded || runner.Status.Phase == atopv1alpha1.RunnerFailed {
+				return ctrl.Result{}, nil
+			}
+
 			job = buildDesiredRunnerJob(runner)
 
 			if err := r.Create(ctx, job); err != nil {
@@ -125,15 +130,41 @@ func (r *RunnerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	}
 
-	// 更新状态
-	if runner.Status.Phase != phase {
-		logger.Info("Updating Runner status", "runner", runner.Name, "oldPhase", runner.Status.Phase, "newPhase", phase)
+	// Stick terminal phase: once Succeeded/Failed, never regress
+	stickyPhase := runner.Status.Phase
+	if stickyPhase != atopv1alpha1.RunnerSucceeded && stickyPhase != atopv1alpha1.RunnerFailed {
+		stickyPhase = phase
 	}
 
-	runner.Status.Phase = phase
-	switch phase {
+	// 更新状态
+	if runner.Status.Phase != stickyPhase {
+		logger.Info("Updating Runner status", "runner", runner.Name, "oldPhase", runner.Status.Phase, "newPhase", stickyPhase)
+	}
+
+	runner.Status.Phase = stickyPhase
+	switch stickyPhase {
 	case atopv1alpha1.RunnerRunning:
-		runner.Status.ReportStatus = "Uploading"
+		// 当 Job 运行中时，根据 mc 容器状态设置 ReportStatus
+		report := "Waiting"
+		podList := &corev1.PodList{}
+		if err := r.List(ctx, podList, client.InNamespace(runner.Namespace), client.MatchingLabels(map[string]string{"job-name": job.Name})); err == nil {
+			for i := range podList.Items {
+				p := podList.Items[i]
+				for j := range p.Status.ContainerStatuses {
+					cs := p.Status.ContainerStatuses[j]
+					if cs.Name == mcContainerName {
+						if cs.State.Running != nil {
+							report = "Uploading"
+						}
+						break
+					}
+				}
+				if report == "Uploading" {
+					break
+				}
+			}
+		}
+		runner.Status.ReportStatus = report
 	case atopv1alpha1.RunnerSucceeded:
 		runner.Status.ReportStatus = "Succeeded"
 	case atopv1alpha1.RunnerFailed:

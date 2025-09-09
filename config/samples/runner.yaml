@@ -4,7 +4,7 @@ metadata:
   name: runner-job
 spec:
   backoffLimit: 0
-  ttlSecondsAfterFinished: 120
+  ttlSecondsAfterFinished: 60
   parallelism: 1
   template:
     spec:
@@ -20,7 +20,7 @@ spec:
           - >
             apache-jmeter-5.4.3/bin/jmeter -n -t src/demo.jmx
             -l /demo/report/test.jtl -e -o /demo/report
-            -JHost=demo.default -Jtimes=90
+            -JHost=demo.default -Jtimes=30
         env: []
   artifacts:
     path: /demo/report
