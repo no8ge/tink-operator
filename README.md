@@ -1,8 +1,96 @@
 # tink-operator
-// TODO(user): Add simple overview of use/purpose
+
+一个基于 Kubernetes Operator 的自动化测试平台，用于管理测试任务的执行和结果收集。
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+
+tink-operator 是一个 Kubernetes Operator，提供了两种自定义资源类型来管理自动化测试：
+
+- **Runner**: 一次性测试任务，基于 Kubernetes Job 实现，适用于单元测试、集成测试等短期任务
+- **Executor**: 长期运行的测试服务，基于 Kubernetes Deployment 实现，适用于性能测试、监控测试等持续运行的任务
+
+该 Operator 集成了 MinIO 客户端，支持自动上传测试结果和报告到 S3 兼容的存储系统，并提供完整的生命周期管理和状态监控。
+
+## 核心特性
+
+- **双模式支持**: Runner（一次性任务）和 Executor（长期服务）
+- **自动结果收集**: 集成 MinIO 客户端，自动上传测试结果到 S3 存储
+- **状态监控**: 实时监控任务状态和报告上传进度
+- **Kubernetes 原生**: 基于 Job 和 Deployment，充分利用 K8s 能力
+- **灵活配置**: 支持自定义存储配置和报告路径
+
+## 使用示例
+
+### Runner 示例（一次性测试任务）
+```yaml
+apiVersion: autotest.atop.io/v1alpha1
+kind: Runner
+metadata:
+  name: unit-test-runner
+spec:
+  parallelism: 1
+  completions: 1
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      containers:
+      - name: test-runner
+        image: golang:1.21
+        command: ["go", "test", "./..."]
+        volumeMounts:
+        - name: shared-data
+          mountPath: /data
+      volumes:
+      - name: shared-data
+        emptyDir: {}
+  artifacts:
+    enabled: true
+    path: /data
+  storage:
+    endpoint: "minio.example.com:9000"
+    bucket: "test-results"
+    prefix: "unit-tests"
+    accessKey: "minioadmin"
+    secretKey: "minioadmin"
+```
+
+### Executor 示例（长期运行服务）
+```yaml
+apiVersion: autotest.atop.io/v1alpha1
+kind: Executor
+metadata:
+  name: performance-test-executor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: performance-test
+  template:
+    metadata:
+      labels:
+        app: performance-test
+    spec:
+      containers:
+      - name: performance-test
+        image: k6:latest
+        command: ["k6", "run", "/scripts/load-test.js"]
+        volumeMounts:
+        - name: shared-data
+          mountPath: /data
+      volumes:
+      - name: shared-data
+        emptyDir: {}
+  artifacts:
+    enabled: true
+    path: /data
+  storage:
+    endpoint: "minio.example.com:9000"
+    bucket: "test-results"
+    prefix: "performance-tests"
+    accessKey: "minioadmin"
+    secretKey: "minioadmin"
+```
 
 ## Getting Started
 
@@ -90,7 +178,32 @@ kubectl apply -f https://raw.githubusercontent.com/<org>/tink-operator/<tag or b
 ```
 
 ## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
+
+我们欢迎社区贡献！如果您想为 tink-operator 项目做出贡献，请遵循以下步骤：
+
+### 开发环境设置
+1. Fork 本仓库到您的 GitHub 账户
+2. 克隆您的 fork 到本地开发环境
+3. 确保安装了所有必要的依赖（Go 1.21+, Docker, kubectl）
+4. 运行 `make help` 查看所有可用的 make 目标
+
+### 贡献流程
+1. 创建功能分支：`git checkout -b feature/your-feature-name`
+2. 进行代码修改并添加测试
+3. 运行测试：`make test`
+4. 确保代码通过 lint 检查：`make lint`
+5. 提交更改：`git commit -m "Add your feature"`
+6. 推送到您的 fork：`git push origin feature/your-feature-name`
+7. 创建 Pull Request
+
+### 代码规范
+- 遵循 Go 语言标准格式
+- 添加适当的注释和文档
+- 为新功能编写测试用例
+- 确保所有测试通过
+
+### 报告问题
+如果您发现 bug 或有功能请求，请在 GitHub Issues 中创建新的 issue，并提供详细的描述和复现步骤。
 
 **NOTE:** Run `make help` for more information on all potential `make` targets
 
