@@ -7690,12 +7690,9 @@ spec:
                 type: string
               reportStatus:
                 type: string
-              reportURL:
-                type: string
             required:
             - phase
             - reportStatus
-            - reportURL
             type: object
         type: object
     served: true

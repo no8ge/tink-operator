@@ -32,7 +32,6 @@ type StorageConfig struct {
 type ExecutorStatus struct {
 	Phase        string `json:"phase"`
 	ReportStatus string `json:"reportStatus"`
-	ReportURL    string `json:"reportURL"`
 }
 
 //+kubebuilder:object:root=true

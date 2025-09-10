@@ -26,7 +26,6 @@ const (
 type RunnerStatus struct {
 	Phase        RunnerPhase `json:"phase"`
 	ReportStatus string      `json:"reportStatus,omitempty"`
-	ReportURL    string      `json:"reportURL,omitempty"`
 }
 
 //+kubebuilder:object:root=true

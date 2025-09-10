@@ -137,16 +137,51 @@ func (r *ExecutorReconciler) reconcileDeployment(ctx context.Context, ex *atopv1
 
 	// 更新状态
 	phase := "Pending"
-	if dep.Status.ReadyReplicas > 0 {
-		phase = "Available"
+	report := "Waiting"
+
+	desired := int32(1)
+	if dep.Spec.Replicas != nil {
+		desired = *dep.Spec.Replicas
 	}
 
-	if ex.Status.Phase != phase {
-		logger.Info("Updating Executor status", "executor", ex.Name, "oldPhase", ex.Status.Phase, "newPhase", phase)
+	// 条件探测
+	progressingTrue := false
+	availableTrue := false
+	deadlineExceeded := false
+	for i := range dep.Status.Conditions {
+		c := dep.Status.Conditions[i]
+		if c.Type == appsv1.DeploymentProgressing && c.Status == corev1.ConditionTrue {
+			progressingTrue = true
+		}
+		if c.Type == appsv1.DeploymentAvailable && c.Status == corev1.ConditionTrue {
+			availableTrue = true
+		}
+		if c.Type == appsv1.DeploymentProgressing && c.Status == corev1.ConditionFalse && c.Reason == "ProgressDeadlineExceeded" {
+			deadlineExceeded = true
+		}
+	}
+
+	switch {
+	case deadlineExceeded:
+		phase = "Degraded"
+		report = "Failed"
+	case dep.Status.AvailableReplicas == desired && availableTrue:
+		phase = "Available"
+		report = "Watching"
+	case progressingTrue || dep.Status.UpdatedReplicas < desired || dep.Status.AvailableReplicas < desired:
+		phase = "Progressing"
+		report = "Waiting"
+	default:
+		phase = "Pending"
+		report = "Waiting"
+	}
+
+	if ex.Status.Phase != phase || ex.Status.ReportStatus != report {
+		logger.Info("Updating Executor status", "executor", ex.Name, "oldPhase", ex.Status.Phase, "newPhase", phase, "report", report)
 	}
 
 	ex.Status.Phase = phase
-	ex.Status.ReportStatus = ""
+	ex.Status.ReportStatus = report
 	if err := r.Status().Update(ctx, ex); err != nil {
 		logger.Error(err, "Failed to update Executor status", "executor", ex.Name)
 		return ctrl.Result{}, err
@@ -244,12 +279,21 @@ func ensureUploadInjectionForPodSpec(podSpec *corev1.PodSpec, artifacts atopv1al
 			// 直接开始上传，无需等待文件信号
 			cmd += "echo 'InitContainer completed, starting upload...'\n"
 		}
+
+		// 使用时间戳和 Pod 名称构建唯一的目标路径，避免不同实例覆盖
+		// 格式：bucket/prefix/timestamp-podname/
+		cmd += "TIMESTAMP=$(date +%Y%m%d-%H%M%S)\n"
+		cmd += "TARGET_PATH=\"atop-dev/$BUCKET/$PREFIX/${TIMESTAMP}-$POD_NAME\"\n"
+		cmd += "echo \"Uploading to: $TARGET_PATH\"\n"
+
 		if withWatch {
 			// Executor 模式：实时监控并上传文件变化
-			cmd += fmt.Sprintf("mc mirror --overwrite --watch --remove %q atop-dev/%s/%s\n", sourcePath, storage.Bucket, storage.Prefix)
+			// 去掉 --remove 避免不同实例互相删除文件
+			cmd += "mc mirror --overwrite --watch $SOURCE_PATH $TARGET_PATH\n"
 		} else {
 			// Runner 模式：一次性上传所有文件
-			cmd += fmt.Sprintf("mc mirror --overwrite --remove %q atop-dev/%s/%s\n", sourcePath, storage.Bucket, storage.Prefix)
+			// 去掉 --remove 避免不同实例互相删除文件
+			cmd += "mc mirror --overwrite $SOURCE_PATH $TARGET_PATH\n"
 			cmd += "echo 'Upload completed successfully'\n"
 		}
 
@@ -262,6 +306,18 @@ func ensureUploadInjectionForPodSpec(podSpec *corev1.PodSpec, artifacts atopv1al
 			Env: []corev1.EnvVar{
 				{Name: "ACCESS_KEY", Value: storage.AccessKeySecret},
 				{Name: "SECRET_KEY", Value: storage.SecretKeySecret},
+				{Name: "BUCKET", Value: storage.Bucket},
+				{Name: "PREFIX", Value: storage.Prefix},
+				{Name: "SOURCE_PATH", Value: sourcePath},
+				// 使用 Downward API 获取 Pod 信息
+				{
+					Name: "POD_NAME",
+					ValueFrom: &corev1.EnvVarSource{
+						FieldRef: &corev1.ObjectFieldSelector{
+							FieldPath: "metadata.name",
+						},
+					},
+				},
 			},
 			VolumeMounts: []corev1.VolumeMount{{Name: volName, MountPath: sourcePath}},
 		}

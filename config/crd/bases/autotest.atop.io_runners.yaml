@@ -7867,8 +7867,6 @@ spec:
                 type: string
               reportStatus:
                 type: string
-              reportURL:
-                type: string
             required:
             - phase
             type: object
