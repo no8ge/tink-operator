@@ -9,11 +9,17 @@ import (
 type RunnerSpec struct {
 	batchv1.JobSpec `json:",inline"`
 
+	// Report artifacts configuration (optional)
+	//+kubebuilder:validation:Optional
 	Artifacts ArtifactsConfig `json:"artifacts,omitempty"`
-	Storage   StorageConfig   `json:"storage,omitempty"`
+
+	// Storage configuration for report upload (optional)
+	//+kubebuilder:validation:Optional
+	Storage StorageConfig `json:"storage,omitempty"`
 }
 
-// RunnerStatus defines the observed state of Runner
+// RunnerPhase is the lifecycle state of a Runner
+// +kubebuilder:validation:Enum=Pending;Running;Succeeded;Failed
 type RunnerPhase string
 
 const (
@@ -23,9 +29,11 @@ const (
 	RunnerFailed    RunnerPhase = "Failed"
 )
 
+// RunnerStatus defines the observed state of Runner
 type RunnerStatus struct {
-	Phase        RunnerPhase `json:"phase"`
-	ReportStatus string      `json:"reportStatus,omitempty"`
+	Phase              RunnerPhase `json:"phase"`
+	ReportStatus       string      `json:"reportStatus,omitempty"`
+	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty"`
 }
 
 //+kubebuilder:object:root=true

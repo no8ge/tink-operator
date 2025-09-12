@@ -43,12 +43,12 @@ spec:
                 description: 产物目录与对象存储，仅当两者同时配置时注入上传逻辑
                 properties:
                   name:
+                    description: 产物名称（可选）
                     type: string
                   path:
+                    description: 产物目录路径，建议以 "/" 开头
+                    pattern: ^/.*
                     type: string
-                required:
-                - name
-                - path
                 type: object
               minReadySeconds:
                 description: |-
@@ -132,21 +132,19 @@ spec:
               storage:
                 properties:
                   accessKeySecret:
+                    description: AccessKey/SecretKey 存储（明文/Secret 引用取决于实现）
                     type: string
                   bucket:
+                    description: MinIO 桶名
                     type: string
                   minioEndpoint:
+                    description: MinIO 访问地址
                     type: string
                   prefix:
+                    description: 上传路径前缀
                     type: string
                   secretKeySecret:
                     type: string
-                required:
-                - accessKeySecret
-                - bucket
-                - minioEndpoint
-                - prefix
-                - secretKeySecret
                 type: object
               strategy:
                 description: The deployment strategy to use to replace existing pods
@@ -7686,7 +7684,16 @@ spec:
           status:
             description: ExecutorStatus defines the observed state of Executor
             properties:
+              lastTransitionTime:
+                format: date-time
+                type: string
               phase:
+                description: ExecutorPhase 表示 Executor 的生命周期阶段
+                enum:
+                - Pending
+                - Progressing
+                - Available
+                - Degraded
                 type: string
               reportStatus:
                 type: string
